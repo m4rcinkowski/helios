@@ -1,0 +1,665 @@
+#!/usr/bin/env node
+
+import { execSync, spawn } from 'child_process';
+import { createWriteStream, writeFileSync, unlinkSync, existsSync } from 'fs';
+import { createServer } from 'http';
+import { connect } from 'net';
+import readline from 'readline';
+import { tmpdir, networkInterfaces } from 'os';
+import { join } from 'path';
+
+// --- COLOR & FORMATTING HELPERS ---
+const fmt = {
+  reset: '\x1b[0m',
+  bold: '\x1b[1m',
+  cyan: '\x1b[36m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  red: '\x1b[31m',
+  dim: '\x1b[2m',
+  hideCursor: '\x1b[?25l',
+  showCursor: '\x1b[?25h',
+};
+
+const log = {
+  info: (msg) => console.log(`${fmt.cyan}ℹ${fmt.reset} ${msg}`),
+  success: (msg) => console.log(`${fmt.green}✔${fmt.reset} ${msg}`),
+  warn: (msg) => console.log(`${fmt.yellow}⚠${fmt.reset} ${msg}`),
+  error: (msg) => console.log(`${fmt.red}✖${fmt.reset} ${msg}`),
+  header: (msg) => console.log(`\n${fmt.bold}${fmt.cyan}=== ${msg} ===${fmt.reset}\n`),
+};
+
+// --- NETWORK INTERFACE RESOLVER ---
+function getPrimaryLocalIP() {
+  const interfaces = networkInterfaces();
+  
+  // Prefer standard physical interfaces (Wi-Fi / Ethernet on macOS: en0, en1)
+  const preferredPrefixes = ['en', 'eth'];
+  
+  for (const prefix of preferredPrefixes) {
+    for (const [name, addrs] of Object.entries(interfaces)) {
+      if (name.startsWith(prefix) && addrs) {
+        for (const addr of addrs) {
+          const isIPv4 = addr.family === 'IPv4' || addr.family === 4;
+          if (isIPv4 && !addr.internal) {
+            return addr.address;
+          }
+        }
+      }
+    }
+  }
+
+  // Fallback: Return any non-internal IPv4 address
+  for (const [name, addrs] of Object.entries(interfaces)) {
+    if (addrs && !name.startsWith('utun') && !name.startsWith('bridge')) {
+      for (const addr of addrs) {
+        const isIPv4 = addr.family === 'IPv4' || addr.family === 4;
+        if (isIPv4 && !addr.internal) {
+          return addr.address;
+        }
+      }
+    }
+  }
+
+  return '127.0.0.1';
+}
+
+// --- LOG FILE ROTATION ---
+const LOG_FILE = 'helios.log';
+const logStream = createWriteStream(LOG_FILE, { flags: 'w' });
+
+function logToFile(source, data) {
+  const time = new Date().toISOString();
+  const text = data.toString().trim();
+  if (text) {
+    logStream.write(`[${time}] [${source}] ${text}\n`);
+  }
+}
+
+log.header('Helios PetCam Launcher');
+log.info(`Log file initialized: ${fmt.bold}${LOG_FILE}${fmt.reset}`);
+
+// --- TEMPORARY MEDIAMTX CONFIG GENERATION ---
+const TEMP_CONFIG_PATH = join(tmpdir(), `helios-mediamtx-${Date.now()}.yml`);
+
+const MEDIAMTX_YAML_CONFIG = `
+paths:
+  all_others: {}
+
+authInternalUsers:
+  - user: any
+    pass: ""
+    ips: []
+    permissions:
+      - action: publish
+        path: ""
+      - action: read
+        path: ""
+`;
+
+try {
+  writeFileSync(TEMP_CONFIG_PATH, MEDIAMTX_YAML_CONFIG.trim(), 'utf8');
+} catch (err) {
+  log.error(`Failed to write temporary configuration file at ${TEMP_CONFIG_PATH}`);
+  process.exit(1);
+}
+
+// --- DEPENDENCY VALIDATION & PATH RESOLUTION ---
+function findExecutable(cmd) {
+  const commonPaths = [
+    `/opt/homebrew/bin/${cmd}`,
+    `/usr/local/bin/${cmd}`,
+    `/usr/bin/${cmd}`,
+  ];
+  for (const p of commonPaths) {
+    if (existsSync(p)) return p;
+  }
+  try {
+    return execSync(`which ${cmd}`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch {
+    return null;
+  }
+}
+
+const ffmpegBin = findExecutable('ffmpeg');
+const mediamtxBin = findExecutable('mediamtx');
+
+if (!ffmpegBin) {
+  log.error(`Missing required dependency: ${fmt.bold}ffmpeg${fmt.reset}`);
+  console.log(`  ${fmt.dim}Installation suggestion:${fmt.reset} brew install ffmpeg\n`);
+  shutdown(1);
+}
+
+if (!mediamtxBin) {
+  log.error(`Missing required dependency: ${fmt.bold}mediamtx${fmt.reset}`);
+  console.log(`  ${fmt.dim}Installation suggestion:${fmt.reset} brew install mediamtx\n`);
+  shutdown(1);
+}
+
+// --- DISCOVER AVFOUNDATION DEVICES ---
+log.info('Enumerating video capture devices...');
+
+function getAVDevices() {
+  const devices = [];
+  try {
+    const rawOutput = execSync(`"${ffmpegBin}" -f avfoundation -list_devices true -i "" 2>&1`, {
+      encoding: 'utf8',
+      env: process.env,
+    });
+
+    const lines = rawOutput.split('\n');
+    let inVideoSection = false;
+
+    for (const line of lines) {
+      if (line.includes('AVFoundation video devices:')) {
+        inVideoSection = true;
+        continue;
+      }
+      if (line.includes('AVFoundation audio devices:') || line.includes('AVFoundation video device options')) {
+        inVideoSection = false;
+        break;
+      }
+
+      if (inVideoSection) {
+        const match = line.match(/\[(\d+)\]\s+(.+)$/);
+        if (match) {
+          const index = match[1];
+          const name = match[2].trim();
+          if (name && !name.includes('AVFoundation')) {
+            devices.push({ index, name });
+          }
+        }
+      }
+    }
+  } catch (e) {
+    if (e.stdout || e.stderr) {
+      const combined = (e.stdout || '') + (e.stderr || '');
+      const lines = combined.split('\n');
+      let inVideoSection = false;
+      for (const line of lines) {
+        if (line.includes('AVFoundation video devices:')) inVideoSection = true;
+        if (line.includes('AVFoundation audio devices:')) inVideoSection = false;
+        if (inVideoSection) {
+          const match = line.match(/\[(\d+)\]\s+(.+)$/);
+          if (match) {
+            devices.push({ index: match[1], name: match[2].trim() });
+          }
+        }
+      }
+    }
+  }
+  return devices;
+}
+
+const availableDevices = getAVDevices();
+
+if (availableDevices.length === 0) {
+  log.error('No AVFoundation video capture devices detected.');
+  shutdown(1);
+}
+
+// --- INTERACTIVE CHECKBOX UI ---
+function selectDevicesInteractive(devices) {
+  return new Promise((resolve) => {
+    const selections = devices.map((d) => {
+      const lower = d.name.toLowerCase();
+      return !(lower.includes('screen') || lower.includes('capture'));
+    });
+
+    let cursor = 0;
+    let initialRender = true;
+
+    readline.emitKeypressEvents(process.stdin);
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true);
+    }
+
+    process.stdout.write(fmt.hideCursor);
+    const totalLines = devices.length + 3;
+
+    function render() {
+      if (!initialRender) {
+        readline.moveCursor(process.stdout, 0, -totalLines);
+      }
+      initialRender = false;
+
+      console.log(`${fmt.bold}Select Capture Devices:${fmt.reset}`);
+      console.log(`${fmt.dim}(Use Up/Down to navigate, Space to toggle, Enter to confirm)${fmt.reset}\n`);
+
+      devices.forEach((dev, i) => {
+        const isSelected = selections[i];
+        const isCurrent = i === cursor;
+
+        const checkbox = isSelected ? `${fmt.green}[x]${fmt.reset}` : `[ ]`;
+        const pointer = isCurrent ? `${fmt.cyan}❯${fmt.reset}` : ' ';
+        const nameStr = isCurrent ? `${fmt.bold}${dev.name}${fmt.reset}` : dev.name;
+
+        const lower = dev.name.toLowerCase();
+        const tag = (lower.includes('screen') || lower.includes('capture')) ? ` ${fmt.dim}(Screen Capture)${fmt.reset}` : '';
+
+        readline.clearLine(process.stdout, 0);
+        console.log(` ${pointer} ${checkbox} ${nameStr}${tag}`);
+      });
+    }
+
+    render();
+
+    function onKeypress(str, key) {
+      if (!key) return;
+      if (key.name === 'up') {
+        cursor = (cursor - 1 + devices.length) % devices.length;
+        render();
+      } else if (key.name === 'down') {
+        cursor = (cursor + 1) % devices.length;
+        render();
+      } else if (key.name === 'space') {
+        selections[cursor] = !selections[cursor];
+        render();
+      } else if (key.name === 'return' || key.name === 'enter') {
+        cleanup();
+        const chosen = devices.filter((_, i) => selections[i]);
+        resolve(chosen);
+      } else if (key.ctrl && key.name === 'c') {
+        cleanup();
+        shutdown(0);
+      }
+    }
+
+    function cleanup() {
+      process.stdin.removeListener('keypress', onKeypress);
+      if (process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+      }
+      process.stdout.write(fmt.showCursor);
+      console.log('');
+    }
+
+    process.stdin.on('keypress', onKeypress);
+  });
+}
+
+const selectedDevices = await selectDevicesInteractive(availableDevices);
+
+if (selectedDevices.length === 0) {
+  log.warn('No devices selected. Exiting Helios.');
+  shutdown(0);
+}
+
+log.success(`Selected ${selectedDevices.length} camera(s) for streaming.`);
+
+// --- EMBEDDED VIEWER HTML GENERATOR ---
+const HTML_CONTENT = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=5.0, user-scalable=yes">
+  <title>Helios PetCam Viewer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; background: #000; font-family: sans-serif; }
+    .container { display: flex; flex-direction: column; width: 100vw; height: 100vh; }
+    @media (orientation: landscape) { .container { flex-direction: row; } .cam-box { width: 50%; height: 100%; } }
+    .cam-box { width: 100%; height: 50%; position: relative; background: #111; border: 1px solid #222; overflow: hidden; touch-action: pan-x pan-y pinch-zoom; }
+    video { width: 100%; height: 100%; object-fit: contain; background: #000; display: block; }
+    .icon-btn { position: absolute; top: 10px; background: rgba(0, 0, 0, 0.75); color: #fff; border: 1px solid rgba(255, 255, 255, 0.4); width: 38px; height: 38px; border-radius: 6px; font-size: 18px; display: flex; align-items: center; justify-content: center; cursor: pointer; z-index: 10; user-select: none; }
+    .fullscreen-btn { right: 10px; } .info-btn { right: 56px; }
+    .meta-overlay { position: absolute; bottom: 10px; left: 10px; background: rgba(0, 0, 0, 0.85); color: #00ffcc; font-family: monospace; font-size: 11px; padding: 6px 10px; border-radius: 4px; pointer-events: none; z-index: 10; line-height: 1.5; border: 1px solid rgba(0, 255, 204, 0.3); display: none; }
+    .meta-overlay.active { display: block; }
+    .meta-time { display: block; font-weight: bold; font-size: 12px; color: #ffffff; margin-bottom: 2px; }
+    .meta-time.stale { color: #ff9900; }
+    .single-mode .cam-box { display: none !important; }
+    .single-mode .cam-box.active { display: block !important; width: 100vw !important; height: 100vh !important; }
+  </style>
+</head>
+<body>
+  <div class="container" id="camContainer">
+    ${selectedDevices.map((dev, idx) => `
+    <div class="cam-box" id="box${idx + 1}" data-index="${idx}">
+      <button class="icon-btn info-btn" onclick="toggleMeta('meta${idx + 1}')">ℹ</button>
+      <button class="icon-btn fullscreen-btn" onclick="toggleSolo('box${idx + 1}')">⛶</button>
+      <div class="meta-overlay" id="meta${idx + 1}">
+        <span class="meta-time" id="time${idx + 1}">Connecting...</span>
+        <span class="meta-stats" id="stats${idx + 1}">---</span>
+      </div>
+      <video id="video${idx + 1}" autoplay playsinline muted></video>
+    </div>`).join('')}
+  </div>
+  <script>
+    const host = window.location.hostname;
+    const camBoxes = Array.from(document.querySelectorAll('.cam-box'));
+    const connections = {};
+
+    async function startStream(path, videoElement, timeElement, statsElement) {
+      if (connections[path]) {
+        try {
+          clearInterval(connections[path].statsTimer);
+          if (connections[path].rvfcId) videoElement.cancelVideoFrameCallback(connections[path].rvfcId);
+          connections[path].pc.close();
+        } catch (e) {}
+      }
+      const pc = new RTCPeerConnection();
+      let lastBytes = 0, lastTimestamp = 0, lastFrameRenderTime = null;
+      const onFrameRendered = () => {
+        lastFrameRenderTime = new Date();
+        if (videoElement.requestVideoFrameCallback) {
+          connections[path].rvfcId = videoElement.requestVideoFrameCallback(onFrameRendered);
+        }
+      };
+      if (videoElement.requestVideoFrameCallback) {
+        connections[path] = connections[path] || {};
+        connections[path].rvfcId = videoElement.requestVideoFrameCallback(onFrameRendered);
+      } else {
+        videoElement.addEventListener('timeupdate', () => { lastFrameRenderTime = new Date(); });
+      }
+      pc.addTransceiver('video', { direction: 'recvonly' });
+      pc.ontrack = (event) => { videoElement.srcObject = event.streams[0]; };
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      try {
+        const res = await fetch(\`http://\${host}:8889/\${path}/whep\`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/sdp' },
+          body: offer.sdp
+        });
+        if (res.ok) {
+          const answerSdp = await res.text();
+          await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+        } else {
+          timeElement.innerText = 'Offline';
+          statsElement.innerText = 'Stream Disconnected';
+        }
+      } catch (err) {
+        timeElement.innerText = 'Error';
+        statsElement.innerText = 'Connection Failed';
+      }
+
+      const statsTimer = setInterval(async () => {
+        const now = new Date();
+        if (lastFrameRenderTime) {
+          const diffSeconds = Math.floor((now - lastFrameRenderTime) / 1000);
+          if (diffSeconds >= 5) {
+            const roundedStaleSeconds = Math.floor(diffSeconds / 5) * 5;
+            timeElement.innerText = \`\${roundedStaleSeconds} seconds ago\`;
+            timeElement.classList.add('stale');
+          } else {
+            timeElement.innerText = lastFrameRenderTime.toLocaleString();
+            timeElement.classList.remove('stale');
+          }
+        } else {
+          timeElement.innerText = 'Waiting for video...';
+        }
+
+        if (!pc || pc.connectionState !== 'connected') return;
+        const stats = await pc.getStats();
+        stats.forEach(report => {
+          if (report.type === 'inbound-rtp' && report.kind === 'video') {
+            const width = videoElement.videoWidth || 0;
+            const height = videoElement.videoHeight || 0;
+            const fps = report.framesPerSecond || 0;
+            const reportNow = report.timestamp;
+            const bytes = report.bytesReceived;
+            let bitrate = 0;
+            if (lastTimestamp > 0) bitrate = ((bytes - lastBytes) * 8) / (reportNow - lastTimestamp);
+            lastBytes = bytes;
+            lastTimestamp = reportNow;
+            statsElement.innerText = \`\${width}x\${height} | \${fps} FPS | \${(bitrate / 1000).toFixed(1)} Mbps\`;
+          }
+        });
+      }, 1000);
+      connections[path] = { ...connections[path], pc, statsTimer };
+    }
+
+    function initAllStreams() {
+      ${selectedDevices.map((_, i) => `
+      startStream('cam${i + 1}', document.getElementById('video${i + 1}'), document.getElementById('time${i + 1}'), document.getElementById('stats${i + 1}'));`).join('')}
+    }
+
+    initAllStreams();
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') initAllStreams(); });
+    function toggleMeta(metaId) { document.getElementById(metaId).classList.toggle('active'); }
+    function requestNativeFullscreen() {
+      const docEl = document.documentElement;
+      if (docEl.requestFullscreen) docEl.requestFullscreen().catch(() => {});
+      else if (docEl.webkitRequestFullscreen) docEl.webkitRequestFullscreen().catch(() => {});
+    }
+    function exitNativeFullscreen() {
+      if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen().catch(() => {});
+    }
+    function showCameraByIndex(index) {
+      const targetBox = camBoxes[index];
+      const container = document.getElementById('camContainer');
+      container.classList.add('single-mode');
+      camBoxes.forEach(b => { b.classList.remove('active'); b.querySelector('.fullscreen-btn').innerText = '⛶'; });
+      targetBox.classList.add('active');
+      targetBox.querySelector('.fullscreen-btn').innerText = '🗗';
+    }
+    function toggleSolo(boxId) {
+      const container = document.getElementById('camContainer');
+      const targetBox = document.getElementById(boxId);
+      if (container.classList.contains('single-mode') && targetBox.classList.contains('active')) {
+        container.classList.remove('single-mode');
+        targetBox.classList.remove('active');
+        targetBox.querySelector('.fullscreen-btn').innerText = '⛶';
+        exitNativeFullscreen();
+      } else {
+        const idx = parseInt(targetBox.getAttribute('data-index'), 10);
+        showCameraByIndex(idx);
+        requestNativeFullscreen();
+      }
+    }
+    let touchStartX = 0, touchStartY = 0;
+    document.addEventListener('touchstart', (e) => { if (e.touches.length === 1) { touchStartX = e.changedTouches[0].screenX; touchStartY = e.changedTouches[0].screenY; } }, false);
+    document.addEventListener('touchend', (e) => {
+      const container = document.getElementById('camContainer');
+      if (!container.classList.contains('single-mode') || e.touches.length > 0) return;
+      const deltaX = e.changedTouches[0].screenX - touchStartX;
+      const deltaY = e.changedTouches[0].screenY - touchStartY;
+      if (Math.abs(deltaX) > Math.abs(deltaY) && Math.abs(deltaX) > 60) {
+        const activeBox = document.querySelector('.cam-box.active');
+        if (!activeBox) return;
+        let currentIndex = parseInt(activeBox.getAttribute('data-index'), 10);
+        currentIndex = deltaX < 0 ? (currentIndex + 1) % camBoxes.length : (currentIndex - 1 + camBoxes.length) % camBoxes.length;
+        showCameraByIndex(currentIndex);
+      }
+    }, false);
+    document.addEventListener('fullscreenchange', () => {
+      if (!document.fullscreenElement) {
+        const container = document.getElementById('camContainer');
+        container.classList.remove('single-mode');
+        camBoxes.forEach(b => { b.classList.remove('active'); b.querySelector('.fullscreen-btn').innerText = '⛶'; });
+      }
+    });
+  </script>
+</body>
+</html>`;
+
+// --- PROCESS SUPERVISOR WITH CLEAN EXIT GUARD ---
+const processes = [];
+const MAX_RAPID_RETRIES = 5;
+const STABILITY_THRESHOLD_MS = 10000;
+
+function checkActiveStreams() {
+  const ffmpegProcesses = processes.filter((p) => p.isFFmpeg);
+  const activeFFmpegs = ffmpegProcesses.filter((p) => p.active);
+
+  if (ffmpegProcesses.length > 0 && activeFFmpegs.length === 0) {
+    log.error('All camera streams failed after maximum retry attempts.');
+    log.error(`Check ${fmt.bold}${LOG_FILE}${fmt.reset} for full details. Exiting Helios completely.`);
+    shutdown(1);
+  }
+}
+
+function spawnManagedProcess(name, command, args, isFFmpeg = false, extraEnv = {}, options = {}) {
+  let procEntry = processes.find((p) => p.name === name);
+
+  if (!procEntry) {
+    procEntry = {
+      name,
+      command,
+      args,
+      isFFmpeg,
+      child: null,
+      active: true,
+      retryCount: 0,
+      startTime: Date.now(),
+    };
+    processes.push(procEntry);
+  }
+
+  procEntry.startTime = Date.now();
+  const retryLabel = procEntry.retryCount > 0 ? ` [Retry #${procEntry.retryCount}/${MAX_RAPID_RETRIES}]` : '';
+  log.info(`Launching ${fmt.bold}${name}${fmt.reset}${retryLabel}...`);
+
+  const child = spawn(command, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, ...extraEnv },
+    ...options,
+  });
+  procEntry.child = child;
+
+  child.stdout.on('data', (d) => logToFile(name, d));
+  child.stderr.on('data', (d) => logToFile(name, d));
+
+  child.on('exit', (code, signal) => {
+    logToFile(name, `Process exited (code ${code}, signal ${signal})`);
+    if (!procEntry.active) return;
+
+    const runtime = Date.now() - procEntry.startTime;
+
+    if (runtime >= STABILITY_THRESHOLD_MS) {
+      logToFile(name, `Process ran stably for ${(runtime / 1000).toFixed(1)}s. Resetting retry count.`);
+      procEntry.retryCount = 0;
+    } else {
+      procEntry.retryCount++;
+    }
+
+    if (procEntry.retryCount > MAX_RAPID_RETRIES) {
+      procEntry.active = false;
+      log.error(`Process ${fmt.bold}${name}${fmt.reset} failed repeatedly (${procEntry.retryCount} rapid crashes). Disabling process.`);
+      checkActiveStreams();
+      return;
+    }
+
+    const backoffMs = Math.pow(2, procEntry.retryCount - 1) * 1000;
+    log.warn(`Process ${fmt.bold}${name}${fmt.reset} exited after ${(runtime / 1000).toFixed(1)}s. Restarting in ${backoffMs / 1000}s...`);
+
+    setTimeout(() => {
+      if (procEntry.active) {
+        spawnManagedProcess(name, command, args, isFFmpeg, extraEnv, options);
+      }
+    }, backoffMs);
+  });
+
+  return child;
+}
+
+// --- DETERMINISTIC TCP PORT HEALTH CHECK ---
+function waitForPort(port, host = '127.0.0.1', timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const startTime = Date.now();
+
+    const tryConnect = () => {
+      const socket = connect(port, host);
+
+      socket.on('connect', () => {
+        socket.end();
+        resolve();
+      });
+
+      socket.on('error', () => {
+        if (Date.now() - startTime > timeoutMs) {
+          reject(new Error(`Timeout waiting for ${host}:${port}`));
+        } else {
+          setTimeout(tryConnect, 250);
+        }
+      });
+    };
+
+    tryConnect();
+  });
+}
+
+// 1. Kill lingering MediaMTX instances
+try {
+  execSync('killall mediamtx', { stdio: 'ignore' });
+} catch (e) {}
+
+// 2. Prevent macOS sleep
+spawnManagedProcess('Caffeinate', 'caffeinate', ['-i', '-s']);
+
+// 3. Launch MediaMTX Server inside OS /tmp so auto.crt / auto.key land in /tmp
+spawnManagedProcess('MediaMTX Server', mediamtxBin, [TEMP_CONFIG_PATH], false, {}, { cwd: tmpdir() });
+
+// 4. Deterministically wait for MediaMTX RTSP port 8554 (IPv4) to accept connections
+log.info('Waiting for MediaMTX RTSP listener socket...');
+try {
+  await waitForPort(8554, '127.0.0.1');
+  log.success('MediaMTX socket ready.');
+} catch (err) {
+  log.error(`MediaMTX failed to start on port 8554. See ${LOG_FILE}`);
+  shutdown(1);
+}
+
+// 5. Launch FFmpeg encoders with explicit IPv4 target URLs
+selectedDevices.forEach((dev, idx) => {
+  const isBrio = dev.name.includes('MX Brio') || dev.name.includes('Brio');
+  const resolution = isBrio ? '1920x1080' : '1280x720';
+  const bitrate = isBrio ? '4M' : '2M';
+  const streamName = `cam${idx + 1}`;
+
+  const ffmpegArgs = [
+    '-use_wallclock_as_timestamps', '1',
+    '-copyts',
+    '-f', 'avfoundation',
+    '-pixel_format', 'nv12',
+    '-framerate', '30',
+    '-video_size', resolution,
+    '-i', dev.name,
+    '-r', '30',
+    '-g', '30',
+    '-keyint_min', '30',
+    '-vf', 'setpts=N/(30*TB),format=yuv420p',
+    '-vcodec', 'h264_videotoolbox',
+    '-b:v', bitrate,
+    '-rtsp_transport', 'tcp',
+    '-f', 'rtsp',
+    `rtsp://127.0.0.1:8554/${streamName}`
+  ];
+
+  spawnManagedProcess(`FFmpeg [${dev.name}]`, ffmpegBin, ffmpegArgs, true);
+});
+
+// 6. Launch Embedded Web Server
+let server = null;
+server = createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/html' });
+  res.end(HTML_CONTENT);
+});
+
+server.listen(8000, () => {
+  const localIP = getPrimaryLocalIP();
+  log.header('Helios Streaming Toolset Ready');
+  log.success(`Viewer live locally at: ${fmt.bold}${fmt.cyan}http://localhost:8000${fmt.reset}`);
+  log.info(`Over local network / VPN, open: ${fmt.bold}${fmt.cyan}http://${localIP}:8000${fmt.reset}`);
+  log.info(`All output logged to: ${fmt.bold}${LOG_FILE}${fmt.reset}`);
+  console.log(`\n${fmt.dim}Press Ctrl+C to stop all Helios processes cleanly.${fmt.reset}\n`);
+});
+
+// --- CLEAN SHUTDOWN HANDLER ---
+function shutdown(exitCode = 0) {
+  log.header('Shutting down Helios...');
+  processes.forEach((proc) => {
+    proc.active = false;
+    if (proc.child) proc.child.kill('SIGTERM');
+  });
+  if (server) server.close();
+  if (existsSync(TEMP_CONFIG_PATH)) {
+    try { unlinkSync(TEMP_CONFIG_PATH); } catch (e) {}
+  }
+  logStream.end();
+  process.exit(exitCode);
+}
+
+process.on('SIGINT', () => shutdown(0));
+process.on('SIGTERM', () => shutdown(0));
