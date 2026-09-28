@@ -2,7 +2,7 @@
 
 A lightweight, zero-dependency Node.js tool that turns any Mac with multiple cameras into a real-time, multi-stream pet monitor accessible over your local network.
 
-https://github.com/user-attachments/assets/57cb7bdb-b513-4941-8ba8-802e4dc31b73
+https://github.com/user-attachments/assets/56c0c656-3886-4dcb-9dbc-496aa789bd6e
 
 ---
 
